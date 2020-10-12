@@ -1,12 +1,18 @@
 import got from 'got'
-import { getOptions } from './options'
-import { Exchange, FilterForExchange } from './types'
+import { getOptions } from '../options'
+import { Exchange, FilterForExchange } from '../types'
+import { MarketInfo, getMarketInfo } from './marketinfo'
 
 export async function getExchangeDetails<T extends Exchange>(exchange: T) {
   const options = getOptions()
-  const exchangeDetails = await got.get(`${options.endpoint}/exchanges/${exchange}`).json()
-
-  return exchangeDetails as ExchangeDetails<T>
+  const exchangeDetails = (await got.get(`${options.endpoint}/exchanges/${exchange}`).json()) as ExchangeDetails<T>
+  const marketInfoDatabase = await getMarketInfo(exchange)
+  if (marketInfoDatabase) {
+    exchangeDetails.availableSymbols.forEach((symbol) => {
+      marketInfoDatabase.mixin(exchange, symbol)
+    })
+  }
+  return exchangeDetails
 }
 
 export type SymbolType = 'spot' | 'future' | 'perpetual' | 'option'
@@ -48,6 +54,7 @@ export type ExchangeDetailsBase<T extends Exchange> = {
     availableSince: string
     availableTo?: string
     name?: string
+    market?: MarketInfo
   }[]
 
   incidentReports: {
