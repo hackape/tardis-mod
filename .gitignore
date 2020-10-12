@@ -2,5 +2,6 @@ node_modules
 /dist
 /*.log
 package-lock.json
+yarn.lock
 .tardis-cache
 *.tsbuildinfo
