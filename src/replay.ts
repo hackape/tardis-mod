@@ -36,7 +36,7 @@ export async function* replay<T extends Exchange, U extends boolean = false, Z e
 
   const fromDate = parseAsUTCDate(from)
   const toDate = parseAsUTCDate(to)
-  const cachedSlicePaths = new Map<string, string>()
+  const cachedSlicePathsMap = new Map<string, string[]>()
   let replayError
   debug('replay for exchange: %s started - from: %s, to: %s, filters: %o', exchange, fromDate.toISOString(), toDate.toISOString(), filters)
 
@@ -45,6 +45,7 @@ export async function* replay<T extends Exchange, U extends boolean = false, Z e
   // initialize worker thread that will fetch and cache data feed slices and "report back" by setting proper key/values in cachedSlicePaths
   const payload: WorkerJobPayload = {
     cacheDir: options.cacheDir,
+    fineGrainCache: options.fineGrainCache,
     endpoint: options.endpoint,
     apiKey: apiKey || options.apiKey,
     userAgent: options._userAgent,
@@ -60,7 +61,7 @@ export async function* replay<T extends Exchange, U extends boolean = false, Z e
   })
 
   worker.on('message', (message: WorkerMessage) => {
-    cachedSlicePaths.set(message.sliceKey, message.slicePath)
+    cachedSlicePathsMap.set(message.sliceKey, message.slicePaths)
   })
 
   worker.on('error', (err) => {
@@ -74,9 +75,6 @@ export async function* replay<T extends Exchange, U extends boolean = false, Z e
   })
 
   try {
-    // helper flag that helps us not yielding two subsequent undefined/disconnect messages
-    let lastMessageWasUndefined = false
-
     let currentSliceDate = new Date(fromDate)
     // iterate over every minute in <=from,to> date range
     // get cached slice paths, read them as file streams, decompress, split by new lines and yield as messages
@@ -85,79 +83,41 @@ export async function* replay<T extends Exchange, U extends boolean = false, Z e
 
       debug('getting slice: %s, exchange: %s', sliceKey, exchange)
 
-      let cachedSlicePath
-      while (cachedSlicePath === undefined) {
-        cachedSlicePath = cachedSlicePaths.get(sliceKey)
+      let cachedSlicePaths
+      while (cachedSlicePaths === undefined) {
+        cachedSlicePaths = cachedSlicePathsMap.get(sliceKey)
 
         // if something went wrong(network issue, auth issue, gunzip issue etc)
         if (replayError !== undefined) {
           throw replayError
         }
 
-        if (cachedSlicePath === undefined) {
+        if (cachedSlicePaths === undefined) {
           // if response for requested date is not ready yet wait 100ms and try again
           debug('waiting for slice: %s, exchange: %s', sliceKey, exchange)
           await wait(100)
         }
       }
 
-      // response is a path to file on disk let' read it as stream
-      const linesStream = createReadStream(cachedSlicePath, { highWaterMark: 128 * 1024 })
-        // unzip it
-        .pipe(zlib.createGunzip({ chunkSize: 128 * 1024 }))
-        .on('error',(err) => {
-          debug('gunzip error %o', err)
-          replayError = err
-        })
-        // and split by new line
-        .pipe(new BinarySplitStream())
-
       let linesCount = 0
-      // date is always formatted to have lendth of 28 so we can skip looking for first space in line and use it
-      // as hardcoded value
-      const DATE_MESSAGE_SPLIT_INDEX = 28
 
-      for await (const line of linesStream) {
-        const bufferLine = line as Buffer
+      const messages = options.fineGrainCache
+        ? mergeMessageStreams(cachedSlicePaths.map((slicePath) => createMessageStream(slicePath, !!withDisconnects)))
+        : createMessageStream(cachedSlicePaths[0], !!withDisconnects)
+
+      for await (const message of messages) {
         linesCount++
-        if (bufferLine.length > 0) {
-          lastMessageWasUndefined = false
-          const localTimestampBuffer = bufferLine.slice(0, DATE_MESSAGE_SPLIT_INDEX)
-          const messageBuffer = bufferLine.slice(DATE_MESSAGE_SPLIT_INDEX + 1)
-          // as any due to https://github.com/Microsoft/TypeScript/issues/24929
-          if (skipDecoding === true) {
-            yield {
-              localTimestamp: localTimestampBuffer,
-              message: messageBuffer
-            } as any
-          } else {
-            const message = JSON.parse(messageBuffer as any)
-            const localTimestampString = localTimestampBuffer.toString()
-            const localTimestamp = new Date(localTimestampString)
-            if (withMicroseconds) {
-              // provide additionally fractions of millisecond at microsecond resolution
-              // local timestamp always has format like this 2019-06-01T00:03:03.1238784Z
-              localTimestamp.μs = parseμs(localTimestampString)
-            }
-
-            yield {
-              // when skipDecoding is not set, decode timestamp to Date and message to object
-              localTimestamp,
-              message
-            } as any
-          }
-          // ignore empty lines unless withDisconnects is set to true
-          // do not yield subsequent undefined messages
-        } else if (withDisconnects === true && lastMessageWasUndefined === false) {
-          lastMessageWasUndefined = true
-          yield undefined as any
+        if (skipDecoding === true) {
+          yield message
+        } else {
+          yield decodeMessage(!!withMicroseconds, message)
         }
       }
 
       debug('processed slice: %s, exchange: %s, count: %d', sliceKey, exchange, linesCount)
 
       // remove slice key from the map as it's already processed
-      cachedSlicePaths.delete(sliceKey)
+      cachedSlicePathsMap.delete(sliceKey)
       // move one minute forward
       currentSliceDate.setUTCMinutes(currentSliceDate.getUTCMinutes() + 1)
     }
@@ -296,6 +256,160 @@ function validateReplayNormalizedOptions(fromDate: Date, normalizers: MapperFact
 
   if (hasBookChangeNormalizer && dateDoesNotStartAtTheBeginningOfTheDay) {
     debug('Initial order book snapshots are available only at 00:00 UTC')
+  }
+}
+
+async function* createMessageStream(cachedSlicePath: string, withDisconnects: boolean) {
+  let replayError
+  // response is a path to file on disk let' read it as stream
+  const linesStream = createReadStream(cachedSlicePath, { highWaterMark: 128 * 1024 })
+    // unzip it
+    .pipe(zlib.createGunzip({ chunkSize: 128 * 1024 }))
+    .on('error', (err) => {
+      debug('gunzip error %o', err)
+      replayError = err
+    })
+    // and split by new line
+    .pipe(new BinarySplitStream())
+
+  // date is always formatted to have lendth of 28 so we can skip looking for first space in line and use it
+  // as hardcoded value
+  const DATE_MESSAGE_SPLIT_INDEX = 28
+
+  // helper flag that helps us not yielding two subsequent undefined/disconnect messages
+  let lastMessageWasUndefined = false
+  for await (const line of linesStream) {
+    if (replayError) throw replayError
+    const bufferLine = line as Buffer
+
+    if (bufferLine.length > 0) {
+      lastMessageWasUndefined = false
+      const localTimestampBuffer = bufferLine.slice(0, DATE_MESSAGE_SPLIT_INDEX)
+      const messageBuffer = bufferLine.slice(DATE_MESSAGE_SPLIT_INDEX + 1)
+      // as any due to https://github.com/Microsoft/TypeScript/issues/24929
+      yield {
+        localTimestamp: localTimestampBuffer,
+        message: messageBuffer
+      } as any
+      // ignore empty lines unless withDisconnects is set to true
+      // do not yield subsequent undefined messages
+    } else if (withDisconnects === true && lastMessageWasUndefined === false) {
+      lastMessageWasUndefined = true
+      yield undefined as any
+    }
+  }
+}
+
+function decodeMessage(withMicroseconds: boolean, message: { localTimestamp: Buffer; message: Buffer } | undefined): any {
+  if (!message) return message
+  const localTimestampBuffer = message.localTimestamp
+  const localTimestampString = localTimestampBuffer.toString()
+  const localTimestamp = new Date(localTimestampString)
+  if (withMicroseconds) {
+    // provide additionally fractions of millisecond at microsecond resolution
+    // local timestamp always has format like this 2019-06-01T00:03:03.1238784Z
+    localTimestamp.μs = parseμs(localTimestampString)
+  }
+
+  // reuse original message object to lower memory impact.
+  const decodedMessage: any = message
+  decodedMessage.localTimestamp = localTimestamp
+  decodedMessage.message = JSON.parse(message.message as any)
+
+  return decodedMessage
+}
+
+// we leverage the fact that localTimestamps are normalized to same format
+// can numeric digits string code points are sequential
+function compareTimestampBuffer(t1: Buffer, t2: Buffer) {
+  for (let i = 17; i < 27; i++) {
+    const delta = t1[i] - t2[i]
+    if (delta > 0) {
+      return 1
+    } else if (delta < 0) {
+      return -1
+    }
+  }
+  return 0
+}
+
+const MESSAGE_EMPTY = Symbol('MESSAGE_EMPTY')
+const MESSAGE_DONE = Symbol('MESSAGE_DONE')
+const enum Slot {
+  ITERATOR,
+  VALUE,
+  TIMESTAMP
+}
+type MessageSlot = [AsyncGenerator, any, Buffer | undefined]
+async function* mergeMessageStreams(streams: AsyncGenerator[]) {
+  let slots: MessageSlot[] = streams.map((iterator) => [iterator, MESSAGE_EMPTY, undefined])
+  let len = slots.length
+  let needCleanup = false
+
+  function fillSlots() {
+    const promises = slots.map((slot) => {
+      const iterator = slot[Slot.ITERATOR]
+      if (slot[Slot.VALUE] === MESSAGE_EMPTY) {
+        return iterator.next().then((result) => {
+          if (result.done) {
+            slot[Slot.VALUE] = MESSAGE_DONE
+            needCleanup = true
+          } else {
+            slot[Slot.VALUE] = result.value
+            slot[Slot.TIMESTAMP] = slot[Slot.VALUE] ? slot[Slot.VALUE].localTimestamp : undefined
+          }
+        })
+      } else {
+        return
+      }
+    })
+    return Promise.all(promises)
+  }
+
+  function cleanupDoneSlots() {
+    if (needCleanup) {
+      slots = slots.filter((slot) => slot[Slot.VALUE] !== MESSAGE_DONE)
+      len = slots.length
+      needCleanup = false
+    }
+  }
+
+  function pickSlot() {
+    return slots.reduce((slot1, slot2) => {
+      if (slot1[Slot.TIMESTAMP] !== undefined && slot2[Slot.TIMESTAMP] !== undefined) {
+        const result = compareTimestampBuffer(slot1[Slot.TIMESTAMP]!, slot2[Slot.TIMESTAMP]!)
+        switch (result) {
+          case -1:
+            return slot1
+          case 1:
+            return slot2
+          default:
+            return slot1
+        }
+      } else {
+        if (slot2[Slot.TIMESTAMP] === undefined) return slot1
+        if (slot1[Slot.TIMESTAMP] === undefined) return slot2
+        return slot1
+      }
+    })
+  }
+
+  while (len) {
+    await fillSlots()
+    cleanupDoneSlots()
+    if (!len) break
+    const slot = pickSlot()
+    const value = slot[Slot.VALUE]
+    // withDisconnects will produce `undefined` value
+    // logically all message slots' value pos will be at `undefined` currently
+    // need to remove them all and yield just one `undefined`
+    if (value === undefined) {
+      yield undefined
+      for (const slot of slots) slot[Slot.VALUE] = MESSAGE_EMPTY
+    } else {
+      yield value
+    }
+    slot[Slot.VALUE] = MESSAGE_EMPTY
   }
 }
 

@@ -6,6 +6,7 @@ const defaultOptions: Options = {
   endpoint: 'https://api.tardis.dev/v1',
   datasetsEndpoint: 'https://datasets.tardis.dev/v1',
   cacheDir: path.join(os.tmpdir(), '.tardis-cache'),
+  fineGrainCache: false,
   apiKey: '',
   _userAgent: `tardis-dev/${pkg.version} (+https://github.com/tardis-dev/tardis-node)`
 }
@@ -24,6 +25,7 @@ type Options = {
   endpoint: string
   datasetsEndpoint: string
   cacheDir: string
+  fineGrainCache: boolean
   apiKey: string
   _userAgent: string
 }
