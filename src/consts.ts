@@ -151,7 +151,8 @@ const BINANCE_FUTURES_CHANNELS = [
   'bookTicker',
   'forceOrder',
   'openInterest',
-  'recentTrades'
+  'recentTrades',
+  'compositeIndex'
 ]
 
 const BINANCE_DELIVERY_CHANNELS = [
@@ -202,7 +203,9 @@ const DELTA_CHANNELS = [
   'spot_price',
   'funding_rate',
   'product_updates',
-  'announcements'
+  'announcements',
+  'all_trades',
+  'v2/ticker'
 ]
 
 const GATE_IO_CHANNELS = ['trades', 'depth', 'ticker']
